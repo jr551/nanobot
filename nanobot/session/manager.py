@@ -10,20 +10,12 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
-from nanobot.utils.helpers import ensure_dir, safe_filename
+from nanobot.utils.helpers import ensure_dir, find_legal_message_start, safe_filename
 
 
 @dataclass
 class Session:
-    """
-    A conversation session.
-
-    Stores messages in JSONL format for easy reading and persistence.
-
-    Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
-    """
+    """A conversation session."""
 
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -43,50 +35,26 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
-    @staticmethod
-    def _find_legal_start(messages: list[dict[str, Any]]) -> int:
-        """Find first index where every tool result has a matching assistant tool_call."""
-        declared: set[str] = set()
-        start = 0
-        for i, msg in enumerate(messages):
-            role = msg.get("role")
-            if role == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict) and tc.get("id"):
-                        declared.add(str(tc["id"]))
-            elif role == "tool":
-                tid = msg.get("tool_call_id")
-                if tid and str(tid) not in declared:
-                    start = i + 1
-                    declared.clear()
-                    for prev in messages[start:i + 1]:
-                        if prev.get("role") == "assistant":
-                            for tc in prev.get("tool_calls") or []:
-                                if isinstance(tc, dict) and tc.get("id"):
-                                    declared.add(str(tc["id"]))
-        return start
-
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
         unconsolidated = self.messages[self.last_consolidated:]
         sliced = unconsolidated[-max_messages:]
 
-        # Drop leading non-user messages to avoid starting mid-turn when possible.
+        # Avoid starting mid-turn when possible.
         for i, message in enumerate(sliced):
             if message.get("role") == "user":
                 sliced = sliced[i:]
                 break
 
-        # Some providers reject orphan tool results if the matching assistant
-        # tool_calls message fell outside the fixed-size history window.
-        start = self._find_legal_start(sliced)
+        # Drop orphan tool results at the front.
+        start = find_legal_message_start(sliced)
         if start:
             sliced = sliced[start:]
 
         out: list[dict[str, Any]] = []
         for message in sliced:
             entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
-            for key in ("tool_calls", "tool_call_id", "name"):
+            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)
@@ -96,6 +64,32 @@ class Session:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self.updated_at = datetime.now()
+
+    def retain_recent_legal_suffix(self, max_messages: int) -> None:
+        """Keep a legal recent suffix, mirroring get_history boundary rules."""
+        if max_messages <= 0:
+            self.clear()
+            return
+        if len(self.messages) <= max_messages:
+            return
+
+        start_idx = max(0, len(self.messages) - max_messages)
+
+        # If the cutoff lands mid-turn, extend backward to the nearest user turn.
+        while start_idx > 0 and self.messages[start_idx].get("role") != "user":
+            start_idx -= 1
+
+        retained = self.messages[start_idx:]
+
+        # Mirror get_history(): avoid persisting orphan tool results at the front.
+        start = find_legal_message_start(retained)
+        if start:
+            retained = retained[start:]
+
+        dropped = len(self.messages) - len(retained)
+        self.messages = retained
+        self.last_consolidated = max(0, self.last_consolidated - dropped)
         self.updated_at = datetime.now()
 
 
@@ -112,15 +106,18 @@ class SessionManager:
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
 
+    @staticmethod
+    def safe_key(key: str) -> str:
+        """Public helper used by HTTP handlers to map an arbitrary key to a stable filename stem."""
+        return safe_filename(key.replace(":", "_"))
+
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
-        safe_key = safe_filename(key.replace(":", "_"))
-        return self.sessions_dir / f"{safe_key}.jsonl"
+        return self.sessions_dir / f"{self.safe_key(key)}.jsonl"
 
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
-        safe_key = safe_filename(key.replace(":", "_"))
-        return self.legacy_sessions_dir / f"{safe_key}.jsonl"
+        return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -161,6 +158,7 @@ class SessionManager:
             messages = []
             metadata = {}
             created_at = None
+            updated_at = None
             last_consolidated = 0
 
             with open(path, encoding="utf-8") as f:
@@ -174,6 +172,7 @@ class SessionManager:
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
+                        updated_at = datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
@@ -182,6 +181,7 @@ class SessionManager:
                 key=key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
+                updated_at=updated_at or datetime.now(),
                 metadata=metadata,
                 last_consolidated=last_consolidated
             )
@@ -211,6 +211,61 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+
+    def delete_session(self, key: str) -> bool:
+        """Remove a session from disk and the in-memory cache.
+
+        Returns True if a JSONL file was found and unlinked.
+        """
+        path = self._get_session_path(key)
+        self.invalidate(key)
+        if not path.exists():
+            return False
+        try:
+            path.unlink()
+            return True
+        except OSError as e:
+            logger.warning("Failed to delete session file {}: {}", path, e)
+            return False
+
+    def read_session_file(self, key: str) -> dict[str, Any] | None:
+        """Load a session from disk without caching; intended for read-only HTTP endpoints.
+
+        Returns ``{"key", "created_at", "updated_at", "metadata", "messages"}`` or
+        ``None`` when the session file does not exist or fails to parse.
+        """
+        path = self._get_session_path(key)
+        if not path.exists():
+            return None
+        try:
+            messages: list[dict[str, Any]] = []
+            metadata: dict[str, Any] = {}
+            created_at: str | None = None
+            updated_at: str | None = None
+            stored_key: str | None = None
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if data.get("_type") == "metadata":
+                        metadata = data.get("metadata", {})
+                        created_at = data.get("created_at")
+                        updated_at = data.get("updated_at")
+                        stored_key = data.get("key")
+                    else:
+                        messages.append(data)
+            return {
+                "key": stored_key or key,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "metadata": metadata,
+                "messages": messages,
+            }
+        except Exception as e:
+            logger.warning("Failed to read session {}: {}", key, e)
+            return None
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
