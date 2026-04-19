@@ -41,6 +41,13 @@ def current_time_str() -> str:
     return f"{now} ({tz})"
 
 
+def strip_think(text: str | None) -> str:
+    """Remove <think>…</think> blocks from model output text."""
+    if not text:
+        return ""
+    return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+
+
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 
 def safe_filename(name: str) -> str:

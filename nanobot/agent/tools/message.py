@@ -29,7 +29,7 @@ class MessageTool(Tool):
         default_channel: str = "",
         default_chat_id: str = "",
         default_message_id: str | None = None,
-    ): 
+    ):
         self._send_callback = send_callback
         self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
         self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
@@ -81,9 +81,10 @@ class MessageTool(Tool):
         chat_id: str | None = None,
         message_id: str | None = None,
         media: list[str] | None = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> str:
         from nanobot.utils.helpers import strip_think
+
         content = strip_think(content)
 
         default_channel = self._default_channel.get()

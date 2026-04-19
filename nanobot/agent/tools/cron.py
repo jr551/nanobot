@@ -111,7 +111,7 @@ class CronTool(Tool):
         errors = super().validate_params(params)
         action = params.get("action")
         if action == "add" and not str(params.get("message") or "").strip():
-            errors.append("message is required when action='add'"
+            errors.append("message is required when action='add'")
         if action == "remove" and not str(params.get("job_id") or "").strip():
             errors.append("job_id is required when action='remove'")
         return errors
@@ -267,15 +267,12 @@ class CronTool(Tool):
             job = self._cron.get_job(job_id)
             if job and job.name == "dream":
                 return (
-                    "Cannot remove job `dream`.
-"
-                    "This is a system-managed Dream memory consolidation job for long-term memory.
-"
+                    "Cannot remove job `dream`.\n"
+                    "This is a system-managed Dream memory consolidation job for long-term memory.\n"
                     "It remains visible so you can inspect it, but it cannot be removed."
                 )
             return (
-                f"Cannot remove job `{job_id}`.
-"
+                f"Cannot remove job `{job_id}`.\n"
                 "This is a protected system-managed cron job."
             )
         return f"Job {job_id} not found"
